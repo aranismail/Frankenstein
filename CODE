@@ -1,0 +1,885 @@
+import os
+import shutil
+import requests
+import time
+import numpy as np
+import copy
+import urllib3
+import random
+import gc
+import multiprocessing
+import subprocess
+
+# Biopython Imports
+from Bio.SeqUtils.ProtParam import ProteinAnalysis
+from Bio.PDB import PDBParser, NeighborSearch, PDBIO, PPBuilder, Superimposer, PDBList
+from Bio.Blast import NCBIWWW, NCBIXML
+
+# OpenMM & Physics Imports
+from pdbfixer import PDBFixer
+import openmm
+from openmm import unit, Vec3, LangevinIntegrator, app, Platform
+from openmm.app import PDBFile, ForceField, Modeller, HBonds, Simulation, OBC2, NoCutoff
+
+# Suppress SSL warnings
+urllib3.disable_warnings()
+
+
+# ==========================================
+# HELPER: GPU DETECTION
+# ==========================================
+def get_gpu_count():
+    try:
+        result = subprocess.check_output(['nvidia-smi', '--list-gpus'], encoding='utf-8')
+        count = len(result.strip().split('\n'))
+        return max(1, count)
+    except:
+        return 1
+
+
+# ==========================================
+# HELPER: WORKER WRAPPER
+# ==========================================
+def run_surgeon_wrapper(task, queue):
+    try:
+        result = run_surgeon_task(task)
+        queue.put(result)
+    except Exception as e:
+        print(f"    -> [PROCESS ERROR] {e}")
+        queue.put(None)
+
+
+def run_surgeon_task(config):
+    walker_id = config['walker_id']
+    gpu_id = config.get('gpu_id', 0)
+    print(f"    -> [WORKER {walker_id}] Starting on GPU {gpu_id}...", flush=True)
+
+    try:
+        local_agent = FrankensteinAgent(gpu_id=gpu_id)
+        power = config['power']
+        duration = config['duration']
+        depth = config['depth']
+        parent_pdb = config['parent_pdb']
+        mobile_res = config['mobile_res']
+        n_total = config['n_total']
+
+        work_pdb = f"temp_input_{walker_id}.pdb"
+        try:
+            shutil.copy(parent_pdb, work_pdb)
+        except:
+            work_pdb = parent_pdb
+
+        current_walker_pdb = work_pdb
+        survivor = True
+
+        try:
+            parent_energy_val = local_agent.get_energy(parent_pdb)
+        except:
+            parent_energy_val = float('inf')
+
+        # <--- CHANGE: Dynamic Relaxation Steps (25k floor, 100k cap)
+        scaling_factor = max(1.0, n_total / 20.0)
+        relax_steps = int(25000 * scaling_factor)
+        relax_steps = min(100000, relax_steps)
+
+        for pulse in range(depth):
+            try:
+                mobile_res_config = config['mobile_res']
+                if isinstance(mobile_res_config, dict):
+                    phase = pulse % 3
+                    current_mobile_res = mobile_res_config[phase]
+                    labels = {0: "TOP 25%", 1: "NEXT 25%", 2: "BOTTOM 50%"}
+                    target_label = labels[phase]
+                else:
+                    current_mobile_res = mobile_res_config
+                    target_label = "STANDARD"
+
+                print(f"       -> [WORKER {walker_id}] Pulse {pulse + 1}/{depth} [{target_label}] (Pushing)...",
+                      flush=True)
+                push_name = f"walker_{walker_id}_p{pulse}.pdb"
+
+                pushed_pdb = local_agent.run_metadynamics(
+                    current_walker_pdb,
+                    output_pdb=push_name,
+                    power_level=power,
+                    duration=duration,
+                    mobile_res=current_mobile_res
+                )
+
+                if not pushed_pdb:
+                    print(f"       -> [WORKER {walker_id}] Failed at PUSH.", flush=True)
+                    survivor = False;
+                    break
+
+                input_for_relax = pushed_pdb
+
+                if input_for_relax:
+                    print(
+                        f"       -> [WORKER {walker_id}] Pulse {pulse + 1}/{depth} (Relaxing 37°C / {relax_steps} steps)...",
+                        flush=True)
+                    relax_name = f"walker_{walker_id}_p{pulse}_relaxed.pdb"
+
+                    relaxed_pdb = local_agent.relax_structure(
+                        input_for_relax,
+                        output_pdb=relax_name,
+                        silent=True,
+                        steps=relax_steps
+                    )
+
+                    if relaxed_pdb:
+                        current_walker_pdb = relaxed_pdb
+                        current_val = local_agent.get_energy(current_walker_pdb)
+
+                        round_idx = config.get('round_idx', 0)
+                        is_cyclic = "_Cyc_" in walker_id
+                        is_even_round = (round_idx + 1) % 2 == 0
+
+                        can_brake = True
+                        if is_cyclic and is_even_round:
+                            if pulse < 4:
+                                can_brake = False
+                                print(
+                                    f"       -> [EXPLORATION] Round {round_idx + 1} Constraint: Ignoring early success to force depth (Pulse {pulse + 1}/5).",
+                                    flush=True)
+
+                        if current_val < parent_energy_val and can_brake:
+                            print(
+                                f"       -> [KICK BRAKE] Improvement found at Pulse {pulse + 1} ({current_val:.2f} < {parent_energy_val:.2f}). Stopping early.",
+                                flush=True)
+                            break
+                    else:
+                        print(f"       -> [WORKER {walker_id}] Failed at RELAX.", flush=True)
+                        survivor = False;
+                        break
+                else:
+                    print(f"       -> [WORKER {walker_id}] Failed at ANNEAL.", flush=True)
+                    survivor = False;
+                    break
+
+            except Exception as e:
+                print(f"       -> [WORKER {walker_id}] CRASHED: {e}", flush=True)
+                survivor = False;
+                break
+
+        if os.path.exists(work_pdb) and "temp_input" in work_pdb:
+            try:
+                os.remove(work_pdb)
+            except:
+                pass
+
+        if survivor:
+            if not os.path.exists(current_walker_pdb):
+                print(f"    -> [WORKER {walker_id}] ERROR: Output file missing!", flush=True)
+                return None
+
+            try:
+                raw_e = local_agent.get_energy(current_walker_pdb)
+                e_per_res = raw_e / n_total
+                print(f"    -> [WORKER {walker_id}] COMPLETED. Energy: {e_per_res:.2f}", flush=True)
+                return {"type": walker_id, "energy": e_per_res, "pdb": current_walker_pdb}
+            except:
+                return None
+        return None
+    except Exception as e:
+        walker_id = config.get('walker_id', 'UNKNOWN')
+        print(f"    -> [WORKER ERROR] {walker_id}: {e}", flush=True)
+        return None
+
+
+# ==========================================
+# CLASSES
+# ==========================================
+class ArchitectAgent:
+    def analyze_sequence(self, sequence, skip_blast=True):
+        analyser = ProteinAnalysis(sequence)
+        return {"molecular_weight": analyser.molecular_weight(), "strategy": "AB_INITIO_FOLDING"}
+
+
+class EngineerAgent:
+    def fold_sequence(self, sequence, job_name="candidate", retries=5):
+        print(f"--- [ENGINEER] Folding Sequence via ESMFold API ---")
+        url = "https://api.esmatlas.com/foldSequence/v1/pdb/"
+        for attempt in range(retries):
+            try:
+                response = requests.post(url, data=sequence, verify=False, timeout=30)
+                if response.status_code == 200:
+                    output_file = f"{job_name}.pdb"
+                    with open(output_file, "w") as f: f.write(response.text)
+                    return output_file
+                time.sleep(2)
+            except:
+                time.sleep(2)
+        return None
+
+
+class CriticAgent:
+    def __init__(self, gpu_id=0):
+        self.gpu_id = str(gpu_id)
+
+    def clean_pdb(self, input_pdb):
+        try:
+            fixer = PDBFixer(filename=input_pdb)
+            fixer.findMissingResidues()
+            fixer.findMissingAtoms()
+            fixer.addMissingAtoms()
+            fixer.removeHeterogens(keepWater=False)
+            fixer.addMissingHydrogens(7.0)
+            fixed_file = "fixed_" + os.path.basename(input_pdb)
+            with open(fixed_file, "w") as f:
+                PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
+            return fixed_file
+        except Exception:
+            return input_pdb
+
+    def get_opencl_platform(self):
+        try:
+            return Platform.getPlatformByName('OpenCL')
+        except:
+            return Platform.getPlatformByName('Reference')
+
+    # Default steps now 25000 (matches logic in worker loop)
+    def relax_structure(self, input_pdb, output_pdb="relaxed.pdb", silent=False, mobile_res=None, steps=25000):
+        if not silent: print(f"--- [CRITIC] Relaxing Structure (37°C) [GPU {self.gpu_id}] ---")
+        try:
+            clean_file = self.clean_pdb(input_pdb)
+            pdb = PDBFile(clean_file)
+            modeller = Modeller(pdb.topology, pdb.positions)
+            forcefield = ForceField('amber99sbildn.xml', 'amber99_obc.xml')
+            modeller.addHydrogens(forcefield)
+            system = forcefield.createSystem(modeller.topology, nonbondedMethod=app.NoCutoff, constraints=None)
+            if mobile_res is not None and hasattr(self, 'apply_position_restraints'):
+                self.apply_position_restraints(system, pdb, mobile_res, k=1000.0)
+            integrator = LangevinIntegrator(310 * unit.kelvin, 100 / unit.picosecond, 0.002 * unit.picoseconds)
+            platform = self.get_opencl_platform()
+            prop = {'OpenCLPrecision': 'single', 'DeviceIndex': self.gpu_id}
+            simulation = Simulation(modeller.topology, system, integrator, platform, prop)
+            simulation.context.setPositions(modeller.positions)
+            if not silent: print(f"    -> Minimizing (OpenCL)...", flush=True)
+            simulation.minimizeEnergy(maxIterations=100)
+            simulation.step(steps)
+            positions = simulation.context.getState(getPositions=True).getPositions()
+            with open(output_pdb, 'w') as f:
+                PDBFile.writeFile(simulation.topology, positions, f)
+            del simulation, integrator, system
+            gc.collect()
+            return output_pdb
+        except Exception as e:
+            if not silent: print(f"    -> PHYSICS FAILURE: {e}")
+            return None
+
+
+class SuperCriticAgent(CriticAgent):
+    def get_energy(self, pdb_file):
+        try:
+            pdb = PDBFile(pdb_file)
+            forcefield = ForceField('amber99sbildn.xml', 'amber99_obc.xml')
+            modeller = Modeller(pdb.topology, pdb.positions)
+            modeller.addHydrogens(forcefield)
+            system = forcefield.createSystem(modeller.topology, nonbondedMethod=app.NoCutoff, constraints=None)
+            integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+            platform = self.get_opencl_platform()
+            prop = {'OpenCLPrecision': 'single', 'DeviceIndex': self.gpu_id}
+            sim = Simulation(modeller.topology, system, integrator, platform, prop)
+            sim.context.setPositions(modeller.positions)
+            state = sim.context.getState(getEnergy=True)
+            val = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+            del sim, integrator, system
+            gc.collect()
+            return val
+        except Exception:
+            return float('inf')
+
+    def anneal_structure(self, input_pdb, output_pdb="annealed.pdb"):
+        try:
+            clean_file = self.clean_pdb(input_pdb)
+            pdb = PDBFile(clean_file)
+            modeller = Modeller(pdb.topology, pdb.positions)
+            forcefield = ForceField('amber99sbildn.xml', 'amber99_obc.xml')
+            modeller.addHydrogens(forcefield)
+            system = forcefield.createSystem(modeller.topology, nonbondedMethod=app.NoCutoff, constraints=None)
+            integrator = LangevinIntegrator(350 * unit.kelvin, 100 / unit.picosecond, 0.002 * unit.picoseconds)
+            platform = self.get_opencl_platform()
+            prop = {'OpenCLPrecision': 'single', 'DeviceIndex': self.gpu_id}
+            simulation = Simulation(modeller.topology, system, integrator, platform, prop)
+            simulation.context.setPositions(modeller.positions)
+            try:
+                simulation.minimizeEnergy(maxIterations=100)
+            except:
+                pass
+            simulation.step(1000)
+            for temp in range(350, 300, -10):
+                integrator.setTemperature(temp * unit.kelvin)
+                simulation.step(2000)
+            simulation.minimizeEnergy(maxIterations=500)
+            state = simulation.context.getState(getPositions=True, getEnergy=True)
+            pot_energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+
+            # <--- CHANGE: Safety limit removed
+            if np.isnan(pot_energy): return None
+
+            positions = state.getPositions()
+            with open(output_pdb, 'w') as f:
+                PDBFile.writeFile(simulation.topology, positions, f)
+            del simulation, integrator, system
+            gc.collect()
+            return output_pdb
+        except Exception as e:
+            return None
+
+
+class AdvancedPhysicsAgent(SuperCriticAgent):
+    def identify_mobile_residues(self, pdb_file, confidence_threshold=80.0):
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure('scan', pdb_file)
+        mobile_residues = set()
+        for i, residue in enumerate(structure.get_residues()):
+            ca_atom = next((a for a in residue if a.name == "CA"), None)
+            if ca_atom:
+                plddt = ca_atom.get_bfactor()
+                if plddt <= 1.0: plddt *= 100.0
+                if plddt < confidence_threshold:
+                    mobile_residues.add(i)
+        return mobile_residues
+
+    def apply_position_restraints(self, system, pdb_object, mobile_residues, k=1000.0):
+        restraint = openmm.CustomExternalForce("k*periodicdistance(x, y, z, x0, y0, z0)^2")
+        restraint.addGlobalParameter("k", k)
+        restraint.addPerParticleParameter("x0")
+        restraint.addPerParticleParameter("y0")
+        restraint.addPerParticleParameter("z0")
+        for atom in pdb_object.topology.atoms():
+            if atom.residue.index not in mobile_residues:
+                pos = pdb_object.positions[atom.index]
+                restraint.addParticle(atom.index, [pos.x, pos.y, pos.z])
+        system.addForce(restraint)
+        return system
+
+    def run_metadynamics(self, input_pdb, output_pdb="metadynamics.pdb", power_level=500.0, duration=20000,
+                         mobile_res=None):
+        try:
+            clean_file = self.clean_pdb(input_pdb)
+            pdb = PDBFile(clean_file)
+            modeller = Modeller(pdb.topology, pdb.positions)
+            forcefield = ForceField('amber99sbildn.xml', 'amber99_obc.xml')
+            modeller.addHydrogens(forcefield)
+            system = forcefield.createSystem(modeller.topology, nonbondedMethod=app.NoCutoff, constraints=None)
+            rmsd_cv = openmm.RMSDForce(modeller.positions, list(range(modeller.topology.getNumAtoms())))
+            bias = openmm.CustomCVForce("bias_k * exp(-(cv_rmsd)^2 / 0.05)")
+            bias.addCollectiveVariable("cv_rmsd", rmsd_cv)
+            bias.addGlobalParameter("bias_k", power_level)
+            bias.setForceGroup(1)
+            system.addForce(bias)
+            integrator = LangevinIntegrator(350 * unit.kelvin, 50 / unit.picosecond, 0.002 * unit.picoseconds)
+            platform = self.get_opencl_platform()
+            prop = {'OpenCLPrecision': 'single', 'DeviceIndex': self.gpu_id}
+            simulation = Simulation(modeller.topology, system, integrator, platform, prop)
+            simulation.context.setPositions(modeller.positions)
+            try:
+                simulation.minimizeEnergy(maxIterations=100)
+            except:
+                return None
+            simulation.step(100)
+            state = simulation.context.getState(getEnergy=True, groups={0})
+            start_energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+            min_steps = 2000
+            improvement_threshold = 15.0
+            required_stability_steps = 1000
+            stability_counter = 0
+            step_chunk = 500
+            current_step = 0
+            while current_step < duration:
+                simulation.step(step_chunk)
+                current_step += step_chunk
+                state = simulation.context.getState(getEnergy=True, groups={0})
+                current_energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                if current_step >= min_steps:
+                    energy_drop = start_energy - current_energy
+                    if energy_drop > improvement_threshold:
+                        stability_counter += step_chunk
+                    else:
+                        stability_counter = 0
+                    if stability_counter >= required_stability_steps:
+                        print(
+                            f"       -> [TIME BRAKE] Stable improvement found (-{energy_drop:.2f} kJ). maintained for {stability_counter} steps. Stopping at {current_step}.",
+                            flush=True)
+                        break
+            integrator.setTemperature(300 * unit.kelvin)
+            simulation.context.setParameter("bias_k", 0.0)
+            simulation.step(500)
+            simulation.minimizeEnergy()
+            positions = simulation.context.getState(getPositions=True).getPositions()
+            with open(output_pdb, 'w') as f:
+                PDBFile.writeFile(simulation.topology, positions, f)
+            del simulation, integrator, system
+            gc.collect()
+            return output_pdb
+        except Exception as e:
+            return None
+
+
+class FrankensteinAgent(AdvancedPhysicsAgent):
+    def validate_structure(self, pdb_file):
+        print(f"       -> [GUARDRAIL] Inspecting {os.path.basename(pdb_file)}...", end="", flush=True)
+        try:
+            if not os.path.exists(pdb_file):
+                print(f" REJECTED (File Missing).")
+                return False
+
+            clean_file = self.clean_pdb(pdb_file)
+            pdb = PDBFile(clean_file)
+            modeller = Modeller(pdb.topology, pdb.positions)
+            forcefield = ForceField('amber99sbildn.xml', 'amber99_obc.xml')
+            modeller.addHydrogens(forcefield)
+            system = forcefield.createSystem(modeller.topology, nonbondedMethod=app.NoCutoff, constraints=None)
+            integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+            platform = Platform.getPlatformByName('Reference')
+            sim = Simulation(modeller.topology, system, integrator, platform)
+            sim.context.setPositions(modeller.positions)
+
+            state = sim.context.getState(getEnergy=True)
+            e = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+            if np.isnan(e) or e < -100000:
+                print(" REJECTED (Singularity detected).")
+                return False
+            sim.step(10)
+            print(" PASSED.")
+            return True
+        except Exception as e:
+            print(f" REJECTED (Crash: {e}).")
+            return False
+
+    def get_stress_map(self, pdb_file):
+        try:
+            clean_file = self.clean_pdb(pdb_file)
+            pdb = PDBFile(clean_file)
+            modeller = Modeller(pdb.topology, pdb.positions)
+            forcefield = ForceField('amber99sbildn.xml', 'amber99_obc.xml')
+            modeller.addHydrogens(forcefield)
+            system = forcefield.createSystem(modeller.topology, nonbondedMethod=app.NoCutoff, constraints=None)
+            integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+            platform = self.get_opencl_platform()
+            prop = {'OpenCLPrecision': 'single', 'DeviceIndex': self.gpu_id}
+            sim = Simulation(modeller.topology, system, integrator, platform, prop)
+            sim.context.setPositions(modeller.positions)
+            state = sim.context.getState(getForces=True)
+            forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
+            residue_stress = {}
+            for atom in modeller.topology.atoms():
+                res_idx = atom.residue.index
+                atom_idx = atom.index
+                f_mag = np.linalg.norm(forces[atom_idx])
+                if res_idx not in residue_stress: residue_stress[res_idx] = []
+                residue_stress[res_idx].append(f_mag)
+            avg_stress_map = []
+            for r_idx, f_vals in residue_stress.items():
+                avg_stress = sum(f_vals) / len(f_vals)
+                avg_stress_map.append((r_idx, avg_stress))
+            avg_stress_map.sort(key=lambda x: x[1], reverse=True)
+            del sim, integrator, system
+            gc.collect()
+            return avg_stress_map
+        except Exception:
+            return []
+
+    def identify_targeted_residues(self, pdb_file, range_start=0.0, range_end=25.0):
+        try:
+            clean_file = self.clean_pdb(pdb_file)
+            pdb = PDBFile(clean_file)
+            modeller = Modeller(pdb.topology, pdb.positions)
+            forcefield = ForceField('amber99sbildn.xml', 'amber99_obc.xml')
+            modeller.addHydrogens(forcefield)
+            system = forcefield.createSystem(modeller.topology, nonbondedMethod=app.NoCutoff, constraints=None)
+            integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+            platform = self.get_opencl_platform()
+            prop = {'OpenCLPrecision': 'single', 'DeviceIndex': self.gpu_id}
+            sim = Simulation(modeller.topology, system, integrator, platform, prop)
+            sim.context.setPositions(modeller.positions)
+            state = sim.context.getState(getForces=True)
+            forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoules_per_mole / unit.nanometer)
+            residue_stress = {}
+            for atom in modeller.topology.atoms():
+                res_idx = atom.residue.index
+                atom_idx = atom.index
+                f_mag = np.linalg.norm(forces[atom_idx])
+                if res_idx not in residue_stress: residue_stress[res_idx] = []
+                residue_stress[res_idx].append(f_mag)
+            avg_stress_map = []
+            for r_idx, f_vals in residue_stress.items():
+                avg_stress = sum(f_vals) / len(f_vals)
+                avg_stress_map.append((r_idx, avg_stress))
+            avg_stress_map.sort(key=lambda x: x[1], reverse=True)
+            total_res = len(avg_stress_map)
+            idx_start = int(total_res * (range_start / 100.0))
+            idx_end = int(total_res * (range_end / 100.0))
+            if idx_end <= idx_start and total_res > 0: idx_end = idx_start + 1
+            target_subset = avg_stress_map[idx_start:idx_end]
+            target_indices = {x[0] for x in target_subset}
+            print(f"    -> [STRESS SCAN] Range {range_start}-{range_end}%: Targeting {len(target_indices)} residues.")
+            del sim, integrator, system
+            gc.collect()
+            return target_indices
+        except Exception:
+            return set(range(100))
+
+    def run_ensemble_with_surgery(self, input_pdb, sequence=None, n_runs=5):
+        print(f"--- [FRANKENSTEIN] Analyzing Complexity & Stability... ---")
+
+        gpu_count = get_gpu_count()
+        print(f"    -> [HARDWARE] Detected {gpu_count} GPU(s).")
+
+        mobile_residues = self.identify_targeted_residues(input_pdb, 0.0, 25.0)
+        from Bio.PDB import PDBParser
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure('x', input_pdb)
+        residues = list(structure.get_residues())
+        n_total = len(residues) if len(residues) > 0 else 1
+        scaling_factor = max(1.0, n_total / 20.0)
+        print(f"    -> [SCALING] Detected {n_total} residues. Scaling Time/Energy by {scaling_factor:.2f}x")
+        print(f"    -> Running Global Relaxation (Batch of {n_runs})...")
+        best_standard_energy = float('inf')
+        best_standard_pdb = None
+        candidates = []
+        for i in range(n_runs):
+            gpu_idx = i % gpu_count
+            self.gpu_id = str(gpu_idx)
+            res = self.relax_structure(input_pdb, output_pdb=f"run_std_{i}.pdb")
+            if not res: res = self.anneal_structure(input_pdb, output_pdb=f"run_std_{i}.pdb")
+            if res:
+                raw_e = self.get_energy(res)
+                e_per_res = raw_e / n_total
+                if raw_e < 0:
+                    candidates.append({"type": "STANDARD", "energy": e_per_res, "pdb": res})
+        if candidates:
+            candidates.sort(key=lambda x: x["energy"])
+            best_standard_pdb = candidates[0]['pdb']
+            best_standard_energy = candidates[0]['energy']
+        else:
+            print("    -> [WARNING] Standard relaxation failed.")
+            best_standard_pdb = input_pdb
+            best_standard_energy = float('inf')
+        print(f"    -> [CHECKPOINT] Phase 1 Complete. Best Energy: {best_standard_energy:.2f} kJ/mol/res")
+        print("    >>> Proceed to Matrix Surgery (24 Rounds)? (y/n): y")
+        print(f"    -> [DECISION] SERIAL MATRIX SURGERY ACTIVATED (24 Rounds).")
+        current_parent_pdb = best_standard_pdb
+        current_parent_energy = best_standard_energy
+        global_champion_pdb = current_parent_pdb
+        global_champion_energy = current_parent_energy
+        global_champion_round = "Standard"
+        n_rounds = 24
+        parent_win_streak = 0
+
+        # <--- CHANGE 1: Updated Energy Levels
+        base_energies = [250.0, 500.0, 750.0, 1000.0]
+
+        max_duration_limit = int(20000 * scaling_factor)
+        energy_levels = [e * scaling_factor for e in base_energies]
+
+        mode = "PARALLEL" if gpu_count > 1 else "SEQUENTIAL"
+        print(f"    -> [SYSTEM] Mode: {mode} + OpenCL + Dual Smart Brake + Guardrails.")
+        ctx = multiprocessing.get_context('spawn')
+
+        for round_idx in range(n_rounds):
+            cycle_pos = round_idx % 6
+            if cycle_pos < 4:
+                range_start, range_end = 0.0, 25.0;
+                target_desc = "TOP 25%"
+            elif cycle_pos == 4:
+                range_start, range_end = 25.0, 50.0;
+                target_desc = "NEXT 25%"
+            else:
+                range_start, range_end = 50.0, 100.0;
+                target_desc = "BOTTOM 50%"
+            depth = max(7, n_total)
+            status_msg = f"DEEP SCAN ({depth} Kicks)"
+            force_multiplier = 1.0
+            print(f"\n    === ROUND {round_idx + 1}/{n_rounds}: {target_desc} [{status_msg}] ===")
+            print(f"    -> Anchor: {current_parent_energy:.2f} kJ/mol/res")
+
+            self.gpu_id = "0"
+            full_stress_map = self.get_stress_map(current_parent_pdb)
+            total_res_count = len(full_stress_map)
+            idx_25 = int(total_res_count * 0.25)
+            idx_50 = int(total_res_count * 0.50)
+            top_25_list = {x[0] for x in full_stress_map[0:idx_25]}
+            mid_25_list = {x[0] for x in full_stress_map[idx_25:idx_50]}
+            bot_50_list = {x[0] for x in full_stress_map[idx_50:]}
+            if not top_25_list: top_25_list = {x[0] for x in full_stress_map}
+            if not mid_25_list: mid_25_list = top_25_list
+            if not bot_50_list: bot_50_list = top_25_list
+            if cycle_pos < 4:
+                active_res = top_25_list
+            elif cycle_pos == 4:
+                active_res = mid_25_list
+            else:
+                active_res = bot_50_list
+            cyclic_targets = {0: top_25_list, 1: mid_25_list, 2: bot_50_list}
+            round_candidates = [{"type": "Parent_Anchor", "energy": current_parent_energy, "pdb": current_parent_pdb}]
+            tasks = []
+            task_counter = 0
+            for e_level in energy_levels:
+                for rep in ['A', 'B']:
+                    walker_id = f"R{round_idx + 1}_Std_E{int(e_level)}_{rep}"
+                    active_power = e_level * force_multiplier
+
+                    assigned_gpu = task_counter % gpu_count
+                    task_counter += 1
+
+                    tasks.append({
+                        "walker_id": walker_id,
+                        "power": active_power,
+                        "duration": max_duration_limit,
+                        "depth": depth,
+                        "parent_pdb": current_parent_pdb,
+                        "mobile_res": active_res,
+                        "n_total": n_total,
+                        "round_idx": round_idx,
+                        "gpu_id": assigned_gpu
+                    })
+            cyclic_energy = 350.0 * scaling_factor * force_multiplier
+            for rep in ['A', 'B']:
+                walker_id = f"R{round_idx + 1}_Cyc_E{int(cyclic_energy)}_{rep}"
+
+                assigned_gpu = task_counter % gpu_count
+                task_counter += 1
+
+                tasks.append({
+                    "walker_id": walker_id,
+                    "power": cyclic_energy,
+                    "duration": max_duration_limit,
+                    "depth": depth,
+                    "parent_pdb": current_parent_pdb,
+                    "mobile_res": cyclic_targets,
+                    "n_total": n_total,
+                    "round_idx": round_idx,
+                    "gpu_id": assigned_gpu
+                })
+
+            if mode == "PARALLEL":
+                active_processes = []
+                for task in tasks:
+                    q = ctx.Queue()
+                    p = ctx.Process(target=run_surgeon_wrapper, args=(task, q))
+                    p.start()
+                    active_processes.append((p, q))
+                for p, q in active_processes:
+                    p.join()
+                    while not q.empty():
+                        res = q.get()
+                        if res: round_candidates.append(res)
+            else:
+                for task in tasks:
+                    q = ctx.Queue()
+                    p = ctx.Process(target=run_surgeon_wrapper, args=(task, q))
+                    p.start()
+                    p.join()
+                    while not q.empty():
+                        res = q.get()
+                        if res: round_candidates.append(res)
+
+            round_candidates.sort(key=lambda x: x["energy"])
+
+            verified_winner = None
+            for cand in round_candidates:
+                if cand['type'] == "Parent_Anchor":
+                    verified_winner = cand
+                    break
+
+                if self.validate_structure(cand['pdb']):
+                    verified_winner = cand
+                    break
+                else:
+                    print(
+                        f"       -> [GUARDRAIL] Discarding {cand['type']} (Energy: {cand['energy']:.2f}). Poisoned/Missing.")
+                    try:
+                        os.remove(cand['pdb'])
+                    except:
+                        pass
+
+            round_winner = verified_winner
+
+            print(f"    -> WINNER: {round_winner['type']} ({round_winner['energy']:.2f} kJ/mol/res)")
+
+            for cand in round_candidates:
+                path = cand.get('pdb')
+                if path and os.path.exists(path):
+                    if path != round_winner['pdb'] and path != current_parent_pdb:
+                        try:
+                            os.remove(path)
+                        except:
+                            pass
+
+            if round_winner['type'] != "Parent_Anchor":
+                current_parent_pdb = round_winner['pdb']
+                current_parent_energy = round_winner['energy']
+                parent_win_streak = 0
+                print("        -> Movement confirmed.")
+                if round_winner['energy'] < global_champion_energy:
+                    print(f"        -> NEW GLOBAL CHAMPION! ({round_winner['energy']:.2f})")
+                    global_champion_pdb = round_winner['pdb']
+                    global_champion_energy = round_winner['energy']
+                    global_champion_round = round_winner['type']
+            else:
+                parent_win_streak += 1
+                print(f"        -> Parent holds the crown.")
+
+        return global_champion_pdb if global_champion_energy < best_standard_energy else best_standard_pdb
+
+
+import os
+import multiprocessing
+
+
+from Bio.PDB import PDBList, PDBParser, PPBuilder, Superimposer
+import numpy as np
+
+# Set start method safely
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
+multiprocessing.freeze_support()
+
+# ==========================================
+# BENCHMARK
+# ==========================================
+def calculate_rmsd(prediction_path, truth_path):
+    print(f"--- [BENCHMARK] Comparing {prediction_path} vs {truth_path} ---")
+    parser = PDBParser(QUIET=True)
+    try:
+        structure_pred = parser.get_structure('pred', prediction_path)
+        structure_true = parser.get_structure('true', truth_path)
+        model_true = structure_true[0]
+        chain_true = list(model_true.get_chains())[0]
+        atoms_true = [atom for atom in chain_true.get_atoms() if atom.get_name() == 'CA']
+        atoms_pred = [atom for atom in structure_pred.get_atoms() if atom.get_name() == 'CA']
+        min_len = min(len(atoms_pred), len(atoms_true))
+        atoms_pred = atoms_pred[:min_len]
+        atoms_true = atoms_true[:min_len]
+        print(f"    -> Aligned {min_len} residues.")
+        sup = Superimposer()
+        sup.set_atoms(atoms_true, atoms_pred)
+        sup.apply(structure_pred.get_atoms())
+        rmsd = sup.rms
+        print(f"    -> RMSD Score: {rmsd:.3f} Angstroms")
+        return rmsd
+    except Exception as e:
+        print(f"    -> BENCHMARK ERROR: {e}")
+        return 999.9
+
+def calculate_gdt_ts(model_pdb, reference_pdb):
+    try:
+        parser = PDBParser(QUIET=True)
+        ref_struct = parser.get_structure('ref', reference_pdb)
+        model_struct = parser.get_structure('model', model_pdb)
+        ref_atoms = [atom for atom in ref_struct.get_atoms() if atom.name == 'CA']
+        model_atoms = [atom for atom in model_struct.get_atoms() if atom.name == 'CA']
+        min_len = min(len(ref_atoms), len(model_atoms))
+        ref_atoms = ref_atoms[:min_len]
+        model_atoms = model_atoms[:min_len]
+        if min_len == 0: return 0.0
+
+        sup = Superimposer()
+        sup.set_atoms(ref_atoms, model_atoms)
+        sup.apply(model_struct.get_atoms())
+        distances = []
+        for r, m in zip(ref_atoms, model_atoms):
+            distances.append(r - m)
+        distances = np.array(distances)
+        p1 = np.sum(distances <= 1.0) / min_len
+        p2 = np.sum(distances <= 2.0) / min_len
+        p4 = np.sum(distances <= 4.0) / min_len
+        p8 = np.sum(distances <= 8.0) / min_len
+        return (p1 + p2 + p4 + p8) / 4 * 100
+    except Exception:
+        return 0.0
+
+CASP_SET = {
+    "T1123 (Phage Protein)": {"pdb": "7UZT", "difficulty": "Hard"},
+    "T1154 (Multi-Domain)": {"pdb": "7UX8", "difficulty": "Very Hard"}
+}
+TARGETS_TO_TEST = ["7UZT", "7UX8"]
+
+def fetch_and_benchmark(target_name, metadata):
+    pdb_id = metadata['pdb']
+    print(f"\n>>> PROCESSING TARGET: {target_name} ({pdb_id}) <<<")
+
+    pdbl = PDBList(verbose=False)
+    truth_file = pdbl.retrieve_pdb_file(pdb_id, pdir=".", file_format="pdb")
+    clean_truth = f"{pdb_id}.pdb"
+    if not os.path.exists(clean_truth) and os.path.exists(truth_file):
+        os.rename(truth_file, clean_truth)
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('truth', clean_truth)
+    ppb = PPBuilder()
+    sequence = ppb.build_peptides(structure)[0].get_sequence()
+    print(f"    -> Extracted Sequence: {sequence[:20]}...")
+
+    engineer = EngineerAgent()
+    raw_name = f"raw_{pdb_id}"
+    raw_file = engineer.fold_sequence(str(sequence), job_name=raw_name)
+    if not raw_file: return None
+
+    # <--- DEBUG: Check Raw Energy ---
+    temp_agent = FrankensteinAgent()
+    raw_e = temp_agent.get_energy(raw_file)
+    print(f"    -> [DEBUG] Raw ESMFold Energy: {raw_e:.2f} kJ/mol")
+    # --------------------------------
+
+    surgeon = FrankensteinAgent()
+    best_pdb = surgeon.run_ensemble_with_surgery(raw_file, str(sequence), n_runs=5)
+
+    if best_pdb and os.path.exists(best_pdb):
+        print(f"    -> [ANALYSIS] Comparing Best Agent Candidate vs. Truth ({pdb_id})...")
+        rmsd = calculate_rmsd(best_pdb, clean_truth)
+        gdt_score = calculate_gdt_ts(best_pdb, clean_truth)
+        print(f"        -> Agent GDT-TS: {gdt_score:.2f} / 100")
+        return rmsd, gdt_score
+    else:
+        return 999.9, 0.0
+
+if __name__ == "__main__":
+    print("==========================================================")
+    print("    THE CASP15 BENCHMARK: FRANKENSTEIN AGENT EDITION      ")
+    print("    (Mode: SERIAL / Replicates / Dual Smart Brake / OpenCL)")
+    print("==========================================================")
+
+
+    results_table = []
+
+
+
+    for target, meta in CASP_SET.items():
+        if meta['pdb'] not in TARGETS_TO_TEST: continue
+        result = fetch_and_benchmark(target, meta)
+
+        if result:
+            score_rmsd, score_gdt = result
+        else:
+            score_rmsd, score_gdt = 999.9, 0.0
+
+        status = "FAILED"
+        if score_rmsd != 999.9:
+            if score_rmsd < 2.0:
+                status = "EXCELLENT"
+            elif score_rmsd < 5.0:
+                status = "ACCEPTABLE"
+            else:
+                status = "POOR"
+
+        results_table.append({
+            "Target": target.split(" (")[0],
+            "PDB": meta['pdb'],
+            "Agent RMSD": f"{score_rmsd:.2f} A" if score_rmsd != 999.9 else "FAIL",
+            "Agent GDT": f"{score_gdt:.1f}",
+            "Status": status
+        })
+
+    print("\n\n==================================================================================")
+    print("                        FINAL PERFORMANCE BENCHMARK                              ")
+    print("==================================================================================")
+    print(f"{'Target':<10} | {'PDB':<5} | {'Agent RMSD':<12} | {'Agent GDT':<10} | {'Status'}")
+    print("-" * 80)
+    for row in results_table:
+        print(f"{row['Target']:<10} | {row['PDB']:<5} | {row['Agent RMSD']:<12} | {row['Agent GDT']:<10} | {row['Status']}")
+    print("==================================================================================")
