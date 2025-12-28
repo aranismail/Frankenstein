@@ -11,9 +11,10 @@ I was inspired by the hybrid models adopted by teams working in the AIMO where A
 
 The solution:
 Frankenstein runs a 2-stage improvement process (excluding the “engineer”, which simply calls ESMFold to produce a baseline structure for us). Extreme energies and instabilities are mostly dealt with by the first stage where thermal relaxation and annealing take place. The second stage (The “Advanced Physics Agent” called by “Frankenstein”) enables 24 rounds of meta-dynamics, where lower-energy structures are found by spawning 8 “workers”, whose job it is to apply energy pulses for short bursts of time to different sections of the protein. This has been designed to mimic the role of cellular ATP (which assists with correct protein folding) as closely as computationally feasible.
-Metric	Initial (First-stage)	Final (Frankenstein Refined)	Improvement
-Energy Density	-19.85 kJ/mol/res	-29.23 kJ/mol/res	~47% Increase in Stability
-Steric Clashes	Present	Resolved	N/A
+
+Improvements for 7UZT test-run:
+Energy Density:	-19.85 kJ/mol/res	-> -29.23 kJ/mol/res	(~47% Increase in Stability)
+Steric Clashes:	Present ->	Resolved
 The pipeline successfully navigated the energy landscape, escaping multiple local minima where standard relaxation failed.
 
 Key features include: GPU parallelisation support; agent logic allows different energies to be applied, and a cyclical worker to apply sequential energies to different sections of the protein; “smart-braking”, where energy is measured after each time-step/energy burst and workers are stopped when lower energy configurations are found (saving computational power and preventing over-correction); physics guardrails to prevent
